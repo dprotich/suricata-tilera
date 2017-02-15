@@ -1,0 +1,595 @@
+#
+# \file Makefile.tilegx
+#
+# This Makefile can be used to build and run Suricata
+# on Tilera systems.
+#
+# This supports both cross compiling suricata on an x86 host
+# for Tilera targets as well as natively compiling suricata
+# on Tilera platforms.
+# 
+# To build suricata natively do the following on your tilera platform
+#
+# make -f tile/Makefile.tilegx autogen build
+#
+# To cross compile suricata do the following on your host
+#
+# make -f tile/Makefile.tilegx autogen xbuild
+#
+# To run Suricata on a "TILEncore-Gx" card from the above directory
+#
+# make -f tile/Makefile.tilegx run_pci
+#
+# or on a "TILEmpower-Gx" or "TILExtreme-Gx" platform
+#
+# make -f tile/Makefile.tilegx run_net
+#
+# To install suricata on a "TILEmpower-Gx" or "TILExtreme-Gx" platform do
+#
+# make -f tile/Makefile.tilegx install
+#
+# \author Tom DeCanio <decanio.tom@gmail.com>
+#
+
+# Default target.
+all:
+
+#ifndef TILERA_ROOT
+#$(error The 'TILERA_ROOT' environment variable is not set.)
+#endif
+
+#
+# Local environment configuration
+# Go ahead and modify these:
+#
+HOME_DIR=/home/$(USER)
+WORK_DIR=$(HOME_DIR)/work
+# you can probably leave the following alone
+CURRENT_DIR=$(PWD)
+RULES_DIR=$(WORK_DIR)/rules
+INSTALL_DIR=$(WORK_DIR)/suricata-install-dir
+RULES_CONFIG=/opt/suricata/etc/suricata.yaml
+YAML_DIR=$(CURRENT_DIR)/../yaml
+GEOIP_DIR=$(CURRENT_DIR)/../geoip
+LOG_DIR=$(WORK_DIR)/logs
+# Uncomment the following to enable GeoIP functionality
+# NOTE: geoip can currently only be built natively
+#ENABLE_GEOIP=--enable-geoip
+
+# Modify the following with the IP address of your Tilera target
+NET_ARGS=--net 192.168.0.10 --reflash
+# Modify the following with the USB port attached to your Tilera target
+WILDCAT_ARGS=--dev usb1
+# Modify the following to point to your locally installed "TILEncore-Gx" card
+PCI_ARGS=--dev gxpci0
+# Modify the following for the desired core clock frequency
+CORE_SPEED = --hvd CPU_SPEED=1200
+# Modify the following to set your POST speed
+POST = --hvd POST=quick
+# Uncomment and modify the following if you want an memprof tile
+#MEMPROF = --hvd MEMPROF_TILE=5,5
+
+.PHONY: all clean
+
+#
+# Run the autogen.sh script. This only needs to be done once in a new directory
+#
+autogen:
+	echo Running autogen.sh
+	./autogen.sh
+
+#
+# Run configure using chosen options. (cross compilation)
+#
+xconfigure:
+	echo Running configure
+	LIBS="-lgxpci -lgxio -ltmc" ./configure --host=tile --prefix=$(INSTALL_DIR) \
+            --disable-gccmarch-native \
+	    --without-libpcap \
+	    --disable-af-packet \
+	    --with-libyaml-includes=$(YAML_DIR)/include \
+	    --with-libyaml-libraries=$(YAML_DIR)/src/.libs \
+	    --with-libmagic-includes=$(TILERA_ROOT)/tile/usr/include \
+	    --with-libmagic-libraries=$(TILERA_ROOT)/tile/usr/lib \
+	    --with-libgeoip-includes=$(GEOIP_DIR)/libGeoIP \
+	    --with-libgeoip-libraries=$(GEOIP_DIR)/libGeoIP/.libs \
+	    $(ENABLE_GEOIP) \
+	    --sysconfdir=/etc \
+	    --localstatedir=/var
+	echo Patching results
+	patch config.h tile/config.h.diff
+	sed -e 's/LDFLAGS =/LDFLAGS = -static/' src/Makefile > src/Makefile.tmp
+	sed -e 's/-I\/usr\/include//' src/Makefile.tmp > src/Makefile
+	rm src/Makefile.tmp
+
+#
+# Run configure using chosen options. (native compilation)
+#
+configure:
+	echo Running configure
+	LIBS="-lgxpci -lgxio -ltmc" ./configure \
+            --disable-gccmarch-native \
+	    --without-libpcap \
+	    --disable-af-packet \
+	    --with-libyaml-includes=$(YAML_DIR)/include \
+	    --with-libyaml-libraries=$(YAML_DIR)/src/.libs \
+	    --with-libmagic-includes=/usr/include \
+	    --with-libmagic-libraries=/usr/lib \
+	    --with-libgeoip-includes=$(GEOIP_DIR)/libGeoIP \
+	    --with-libgeoip-libraries=$(GEOIP_DIR)/libGeoIP/.libs \
+	    $(ENABLE_GEOIP) \
+	    --sysconfdir=/etc \
+	    --localstatedir=/var
+	sed -e 's/LDFLAGS =/LDFLAGS = -static/' src/Makefile > src/Makefile.tmp
+	cp src/Makefile.tmp src/Makefile
+	rm src/Makefile.tmp
+
+#
+# Rebuild everything from after autoconf.sh (cross compilation)
+#
+xbuild: xconfigure
+	echo building Suricata
+	make clean
+	make
+
+#
+# Rebuild everything from after autoconf.sh (native compilation)
+#
+build: configure
+	echo building Suricata
+	make clean
+	make -j 30
+
+#
+# Install suricata to the system.
+# This is intended for Tilempower and Tilextreme systems.
+# Must have write access to installation # directory.  Note on tilegx pcie
+# cards tile-monitor will likely not have write access to the $TILERA_ROOT
+# directory on the host
+#
+install:
+	echo Running install
+	make install
+
+TILE_MONITOR = $(TILERA_ROOT)/bin/tile-monitor
+
+# The --hvx switch allows us to add to the linux boot parameters.  In
+# this case, we change the boot configuration to have tiles 1-55 run
+# in 'dataplane' mode.  (In the current release, tile 0 has some overhead
+# that makes it a poor choice for dataplane.)
+BOOT_ARGS = --hvd "ARGS=" \
+            --hvx "TLR_INTERACTIVE=n" \
+            --hvx "TLR_TELNETD=n" \
+            --hvx "TLR_SSHD=n" \
+            --hvx "TLR_HUGEPAGES=y" \
+            --hvx "dataplane=1-35"
+
+CONFIG = gx36
+
+IMAGE_FILE = $(CONFIG)-dataplane.image
+
+$(IMAGE_FILE):
+	@echo Building dataplane image file: this will take about ten minutes.
+	$(TILE_MONITOR) --simulator --config $(CONFIG) --functional --console \
+	  --create-image $@.tmp $(BOOT_ARGS)
+	mv $@.tmp $@
+
+
+TILE_MONITOR_ARGS = \
+  --hvx "dataplane=1-35" \
+  --huge-pages 800 \
+  --mkdir /opt/test --cd /opt/test \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/.libs/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -c $(RULES_CONFIG) --mpipe -+-
+
+
+TILE_MONITOR_STATIC_ARGS = \
+  --hvx "dataplane=1-35" \
+  --huge-pages 800 \
+  --mkdir /opt/test --cd /opt/test \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload $(TILERA_ROOT)/tile/lib/libpcre.so.0.0.1 /lib/libpcre.so.0 \
+  --upload $(TILERA_ROOT)/tile/lib/libnl.so.1.1 /lib/libnl.so.1 \
+  --upload $(TILERA_ROOT)/tile/usr/lib/libpcap.so.1.0.0 /usr/lib/libpcap.so.1 \
+  --upload ./src/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -c $(RULES_CONFIG) --mpipe -+-
+
+TILE_MONITOR_UT_ARGS = \
+  --huge-pages 800 \
+  --mkdir /opt/test --cd /opt/test \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/.libs/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -u -+-
+
+WILDCAT_CPU = --hvd CHIP_WIDTH=6 --hvd CHIP_HEIGHT=6
+
+TILE_MONITOR_WILDCAT_ARGS = \
+  $(WILDCAT_CPU) \
+  $(WILDCAT_SPEED) \
+  --hvx "dataplane=1-35" \
+  --hvx "TLR_NETWORK=gbe1" \
+  --huge-pages 800 \
+  --mount $(RULES_DIR) /opt \
+  --upload $(TILERA_ROOT)/tile/lib/libcap-ng.so.0.0.0 /lib/libcap-ng.so.0 \
+  --upload $(TILERA_ROOT)/tile/lib/libpcre.so.0.0.1 /lib/libpcre.so.0 \
+  --upload $(TILERA_ROOT)/tile/lib/libz.so.1.2.3 /lib/libz.so.1 \
+  --upload $(TILERA_ROOT)/tile/lib/libnl.so.1.1 /lib/libnl.so.1 \
+  --upload $(TILERA_ROOT)/tile/usr/lib/libpcap.so.1.0.0 /usr/lib/libpcap.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/.libs/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -c $(RULES_CONFIG) -i xgbe3 -+-
+
+#  --run -+- strace -e !nanosleep /suricata -c /opt/suricata/etc/suricata.yaml -I xgbe3 -+-
+
+#  --hvx "kcache_hash=none"
+
+# This is sized for an 8GB Cannon card
+#  --vmlinux $(HOME_DIR)/work/linux/vmlinux \
+
+
+#  --hv-bin-dir $(TILERA_ROOT)/src/sys/hv \
+
+TILE_MONITOR_CANNON_STATIC_ARGS = \
+  --hvx "dataplane=1-35" \
+  --hvx "hugepagesz=256m hugepages=1" \
+  $(POST) $(CORE_SPEED) $(MEMPROF) \
+  --huge-pages 400 \
+  --mount-tile /bin \
+  --mount-tile /lib \
+  --mount-tile /usr \
+  --mount $(RULES_DIR) /opt \
+  --mount $(LOG_DIR) /var/log/suricata \
+  --tunnel 10022 22 \
+  --upload ./src/suricata suricata \
+  --run -+- suricata -c $(RULES_CONFIG) --mpipe -+-
+
+TILE_MONITOR_CANNON_CAPTURE_ARGS = \
+  --hvx "dataplane=1-35" \
+  --hvx "hugepagesz=256m hugepages=1" \
+  $(POST) $(CORE_SPEED) $(MEMPROF) \
+  --huge-pages 400 \
+  --vmlinux $(HOME_DIR)/work/linux/vmlinux \
+  --quit; \
+  $(TILERA_ROOT)/bin/parallelize \
+  -++- $(TILE_MONITOR) --resume $(PCI_ARGS) \
+    --mount-tile /bin \
+    --mount-tile /lib \
+    --mount-tile /usr \
+    --mount $(RULES_DIR) /opt \
+    --mount $(LOG_DIR) /var/log/suricata \
+    --upload ./src/suricata suricata \
+    --run -+- suricata -c $(RULES_CONFIG) --mpipe -+- \
+  -++- /home/$(USER)/hack/gxpci_host_pq/run6.sh
+
+# This boots a Wildcat and leaves it available for manipulation by hand
+TILE_MONITOR_WILDCAT_BOOT_STATIC_ARGS = \
+  --hvx "dataplane=1-35" \
+  --hvx "hugepagesz=1g hugepages=2" \
+  $(POST) $(WILDCAT_SPEED) $(MEMPROF) \
+  --huge-pages 800 \
+  --mount-tile /bin \
+  --mount-tile /lib \
+  --mount-tile /usr \
+  --mount $(RULES_DIR) /opt \
+  --mount $(LOG_DIR) /var/log/suricata \
+  --upload ./src/suricata suricata
+
+# This is sized for an 16GB Wildcat card
+TILE_MONITOR_WILDCAT_STATIC_ARGS = \
+  $(TILE_MONITOR_WILDCAT_BOOT_STATIC_ARGS) \
+  --run -+- suricata -c $(RULES_CONFIG) --mpipe -+-
+
+TILE_MONITOR_WILDCAT_FEEDBACK_ARGS = \
+  --hvx "dataplane=1-35" \
+  $(POST) $(WILDCAT_SPEED) $(MEMPROF) \
+  --huge-pages 800 \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/.libs/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -c $(RULES_CONFIG) -i xgbe3 -+- \
+  --download /tmp/raw_feedback raw_feedback
+
+TILE_MONITOR_WILDCAT_FEEDBACK_STATIC_ARGS = \
+  --hvx "dataplane=1-35" \
+  $(POST) $(WILDCAT_SPEED) $(MEMPROF) \
+  --huge-pages 800 \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --run -+- suricata -c $(RULES_CONFIG) -i xgbe3 -+- \
+  --download /tmp/raw_feedback raw_feedback
+
+TILE_MONITOR_WILDCAT_PROFILE_ARGS = \
+  $(WILDCAT_CPU) \
+  $(POST) $(WILDCAT_SPEED) $(MEMPROF) \
+  --hvx "dataplane=1-35" \
+  --hvx "TLR_NETWORK=gbe1" \
+  --huge-pages 800 \
+  --mount-tile /usr/lib \
+  --mount-tile /lib \
+  --mount $(RULES_DIR) /opt \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1.0.2 /lib/libhtp-0.2.so.1.0.2 \
+  --upload ./libhtp/htp/.libs/libhtp-0.2.so.1 /lib/libhtp-0.2.so.1 \
+  --upload ./libhtp/htp/.libs/libhtp.so /lib/libhtp.so \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2.0.1 /lib/libyaml-0.so.2.0.1 \
+  --upload $(YAML_DIR)/src/.libs/libyaml-0.so.2 /lib/libyaml-0.so.2 \
+  --upload $(YAML_DIR)/src/.libs/libyaml.so /lib/libyaml.so \
+  --upload ./src/.libs/suricata suricata \
+  --run -+- mkdir -p /var/log/suricata -+- \
+  --launch -+- suricata -c $(RULES_CONFIG) -i xgbe3 -+- \
+  --run -+- sleep 210 -+- \
+  --profile-init --profile-kernel \
+  --profile-reset \
+  --profile-events '--event=ONE:10000000 --event=INSTRUCTION_BUNDLE:10000000 --event=LOAD_STALL:10000000 --event=INSTRUCTION_STALL:10000000' \
+  --profile-start \
+  --run -+- sleep 300 -+- \
+  --profile-stop \
+  --profile-dump \
+  --profile-capture samples \
+  --profile-analyze samples \
+  --profile-shutdown \
+  --quit
+
+TILE_MONITOR_WILDCAT_PROFILE_STATIC_ARGS = \
+  --hvx "dataplane=1-35" \
+  --hvx "hugepagesz=1g hugepages=2" \
+  $(POST) $(WILDCAT_SPEED) $(MEMPROF) \
+  --huge-pages 800 \
+  --mount-tile /bin \
+  --mount-tile /lib \
+  --mount-tile /usr/lib \
+  --mount $(RULES_DIR) /opt \
+  --mount $(LOG_DIR) /var/log/suricata \
+  --upload ./src/suricata suricata \
+  --launch -+- suricata -c $(RULES_CONFIG) --mpipe -+- \
+  --run -+- sleep 210 -+- \
+  --profile-init --profile-kernel \
+  --profile-reset \
+  --profile-events '--event=ONE:10000000 --event=INSTRUCTION_BUNDLE:10000000 --event=LOAD_STALL:10000000 --event=INSTRUCTION_STALL:10000000' \
+  --profile-start \
+  --run -+- sleep 300 -+- \
+  --profile-stop \
+  --profile-dump \
+  --profile-capture samples \
+  --profile-analyze samples \
+  --profile-shutdown \
+  --quit
+
+FUNCTIONAL=--functional
+PROFILE=--sim-args -+- --xml-profile profile.xml --profile-disable-at-startup -+-
+
+ARGS := mpipe0:mac=2:input=$(PCAPFILE):output=output.pcap:bps=10G:stall
+
+SIM_ARGS := --sim-args -+- --extra-shim-args "$(ARGS)" -+-
+
+SIM_DEPS := $(PCAP_FILE)
+
+#
+# The following make targets are intended for Suricata "users" to execute
+# suricata on Tilera platforms.
+#
+
+# boot and run suricata via a network interface
+run_net: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_STATIC_ARGS)
+
+# boot and run suricata on a "TILEncore-Gx" card via pcie interface
+run_pci: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(PCI_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_CANNON_STATIC_ARGS)
+
+# boot and run suricata via USB interface
+run_usb: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_STATIC_ARGS)
+
+# place a proper tilera boot image on a "TILEmpower-Gx" or "TILExtreme-Gx"
+# system in anticipation of running suricata from the machine's SSD
+reimage_net:
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--hvx "dataplane=1-35" \
+        --hvx "hugepagesz=1g hugepages=2" \
+	--huge-pages 800 \
+        $(MEMPROF) \
+	--rootfs /dev/sda1 -- mount
+
+#
+# The following make targets are intended for Suricata "developers" to execute
+# suricata on Tilera platforms and perform additional analysis
+#
+
+#
+# Rebuild with unittests support (native compilation)
+#
+build_unittests:
+	echo Running configure
+	LIBS="-lgxpci -lgxio -ltmc" ./configure \
+            --enable-unittests \
+            --disable-gccmarch-native \
+	    --without-libpcap \
+	    --disable-af-packet \
+	    --with-libyaml-includes=$(YAML_DIR)/include \
+	    --with-libyaml-libraries=$(YAML_DIR)/src/.libs \
+	    --with-libmagic-includes=/usr/include \
+	    --with-libmagic-libraries=/usr/lib
+	sed -e 's/LDFLAGS =/LDFLAGS = -static/' src/Makefile > src/Makefile.tmp
+	sed -e 's/-I\/usr\/include//' src/Makefile.tmp > src/Makefile
+	rm src/Makefile.tmp
+	echo building Suricata
+	make clean
+	make -j 30
+
+# boot and upload suricata via a network interface
+# useful for testing as if this was installed on SSD
+boot_net: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+	$(NET_ARGS) \
+	$(TILE_MONITOR_WILDCAT_BOOT_STATIC_ARGS)
+
+# boot tilera and mount home directory
+# useful for testing as if this was installed on SSD
+boot_home:
+	$(TILE_MONITOR) \
+	$(NET_ARGS) \
+	--root --mount-same $(HOME_DIR)
+
+# boot and run suricata on a "TILEncore-Gx" card via pcie interface
+# with pcie forwarding enabled (note requires gxpci_host_pq and a
+# modified MDE.  NOT FOR GENERAL CONSUMPTION.
+run_pci_capture: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(PCI_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_CANNON_CAPTURE_ARGS)
+
+# run a dynamically linked suricata 
+run_wc_dyn: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_ARGS)
+
+
+# run a dynamically linked suricata 
+run_net_dyn: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_ARGS)
+
+# produce compiler feedback on dynamic linked suricata
+fb_wc: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_FEEDBACK_ARGS)
+
+# produce compiler feedback on static linked suricata
+fb_wc_static: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_FEEDBACK_STATIC_ARGS)
+
+# produce compiler feedback on static linked suricata
+fb_net_static: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_FEEDBACK_STATIC_ARGS)
+
+# profile suricata
+prof_wc: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_PROFILE_ARGS)
+
+# profile suricata staticaly linked suricata
+prof_wc_static: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(WILDCAT_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_PROFILE_STATIC_ARGS)
+
+# profile suricata dynamically linked suricata via network
+prof_net: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_PROFILE_ARGS)
+
+# profile suricata statically linked suricata via network
+prof_net_static: $(SIM_DEPS)
+	$(TILE_MONITOR) \
+        $(NET_ARGS) \
+	--debug-on-crash \
+	$(TILE_MONITOR_WILDCAT_PROFILE_STATIC_ARGS)
+
+#
+# The following make targets are no longer supported but have been
+# kept here in commented form in case they are resurrected at some
+# future time
+#
+
+#
+#run_sim: $(SIM_DEPS) $(IMAGE_FILE)
+#	$(TILE_MONITOR) --image-file $(IMAGE_FILE) \
+#     $(FUNCTIONAL) \
+#     $(PROFILE) \
+#     --debug-on-crash \
+#	 $(SIM_ARGS) $(TILE_MONITOR_ARGS)
+
+#run_sim_static: $(SIM_DEPS) $(IMAGE_FILE)
+#	$(TILE_MONITOR) --image-file $(IMAGE_FILE) \
+#     $(FUNCTIONAL) \
+#     $(PROFILE) \
+#     --debug-on-crash \
+#	 $(SIM_ARGS) $(TILE_MONITOR_STATIC_ARGS)
+
+#run_ut_sim: $(SIM_DEPS) $(IMAGE_FILE)
+#	$(TILE_MONITOR) --image-file $(IMAGE_FILE) \
+#     --functional \
+#     --debug-on-crash \
+#	 $(SIM_ARGS) $(TILE_MONITOR_UT_ARGS)
+
+#fb_sim: $(SIM_DEPS) $(IMAGE_FILE)
+#	$(TILE_MONITOR) --image-file $(IMAGE_FILE) \
+#        $(FUNCTIONAL) \
+#     --debug-on-crash \
+#	    $(SIM_ARGS) $(TILE_MONITOR_WILDCAT_FEEDBACK_ARGS)
+
+
+#.PHONY: run_sim
